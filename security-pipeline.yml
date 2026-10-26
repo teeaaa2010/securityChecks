@@ -1,0 +1,322 @@
+# .github/workflows/security-pipeline.yml
+#
+# Sample DevSecOps pipeline: several independent security checks run in
+# parallel, results are uploaded to the GitHub Security tab (SARIF), and a
+# final "gate" job decides whether the build may proceed to deploy.
+#
+# NOTE: Action versions below are examples. For production, pin every third-party
+# action to a full commit SHA (e.g. uses: owner/repo@<40-char-sha> # v1.2.3)
+# and let Dependabot keep them current.
+
+name: Security Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 1"      # weekly full scan: catches newly published CVEs
+  workflow_dispatch:
+
+# Least privilege by default; jobs elevate only what they need.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: sample-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Secret scanning: detect committed credentials and API keys
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # full history so past commits are scanned too
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}  # required for orgs
+
+  # ---------------------------------------------------------------------------
+  # 2. SAST: CodeQL (deep semantic analysis)
+  # ---------------------------------------------------------------------------
+  codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, python]   # adjust to your repo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - uses: github/codeql-action/autobuild@v3
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ---------------------------------------------------------------------------
+  # 3. SAST: Semgrep (fast, rule-based; good complement to CodeQL)
+  # ---------------------------------------------------------------------------
+  semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config p/ci --config p/owasp-top-ten \
+            --sarif --output semgrep.sarif \
+            --error --severity ERROR
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------------------
+  # 4. Dependency / SCA checks
+  # ---------------------------------------------------------------------------
+  dependency-review:
+    name: Dependency review (PRs)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0, AGPL-3.0
+          comment-summary-in-pr: on-failure
+
+  dependency-scan:
+    name: Dependency scan (Trivy filesystem)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan lockfiles for known vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "1"
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  # ---------------------------------------------------------------------------
+  # 5. Infrastructure-as-Code and Dockerfile misconfiguration scan
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    name: IaC / config scan (Trivy config)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Terraform, Kubernetes, Dockerfile, workflows
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-config.sarif
+          exit-code: "1"
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+  # ---------------------------------------------------------------------------
+  # 6. Container build, image vulnerability scan, and SBOM
+  # ---------------------------------------------------------------------------
+  container-scan:
+    name: Container scan + SBOM
+    runs-on: ubuntu-latest
+    needs: [secret-scan]         # don't build if secrets were leaked
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "1"
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 7. DAST: baseline scan of the running application (OWASP ZAP)
+  # ---------------------------------------------------------------------------
+  dast:
+    name: DAST (OWASP ZAP baseline)
+    runs-on: ubuntu-latest
+    needs: [container-scan, codeql, semgrep]   # only test apps that passed static checks
+    if: github.event_name != 'pull_request'    # keep PR feedback fast
+    permissions:
+      contents: read
+      issues: write                            # ZAP action opens a summary issue
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and start the app
+        run: |
+          docker build -t "$IMAGE_NAME:$IMAGE_TAG" .
+          docker run -d --name app -p 8080:8080 "$IMAGE_NAME:$IMAGE_TAG"
+          # Wait until the app responds (adjust path/port to your app)
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:8080/ >/dev/null && exit 0
+            sleep 2
+          done
+          docker logs app
+          exit 1
+
+      - name: ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: http://localhost:8080
+          fail_action: true
+          cmd_options: "-a"                    # include alpha passive rules
+
+      - name: Stop app
+        if: always()
+        run: docker rm -f app || true
+
+  # ---------------------------------------------------------------------------
+  # 8. Gate: single required status check summarising all security jobs
+  #    Mark "Security gate" as a required check in branch protection.
+  # ---------------------------------------------------------------------------
+  security-gate:
+    name: Security gate
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - secret-scan
+      - codeql
+      - semgrep
+      - dependency-review
+      - dependency-scan
+      - iac-scan
+      - container-scan
+      - dast
+    steps:
+      - name: Evaluate results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # "skipped" is acceptable (e.g. dependency-review on push, dast on PRs)
+          if echo "$RESULTS" | jq -e '[.[] | .result] | any(. == "failure" or . == "cancelled")' >/dev/null; then
+            echo "::error::One or more security checks failed."
+            exit 1
+          fi
+          echo "All security checks passed."
+
+  # ---------------------------------------------------------------------------
+  # 9. Deploy only if the gate passed (placeholder)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [security-gate]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production        # add required reviewers in repo settings
+    permissions:
+      contents: read
+      id-token: write              # OIDC to your cloud provider: no long-lived keys
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: echo "Deploying ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}..."
